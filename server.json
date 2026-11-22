@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.mcpmessenger/glazyr",
+  "title": "Glazyr",
+  "description": "Zero-copy browser perception for AI agents over MCP. ~13x fewer tokens than CDP or Playwright.",
+  "repository": {
+    "url": "https://github.com/mcpmessenger/glazyr-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://glazyr.com",
+  "version": "0.2.4",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@glazyr/mcp",
+      "version": "0.2.4",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "-y"
+        }
+      ]
+    }
+  ]
+}
