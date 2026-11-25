@@ -1,0 +1,31 @@
+{
+  "bin": {
+    "glazyr-mcp": "launcher.js"
+  },
+  "description": "Glazyr \u2014 zero-copy browser perception for AI agents over MCP. A patched Chromium writes page state into shared memory; agents read curated state at a fraction of the token cost of CDP or Playwright.",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "launcher.js",
+    "bridge",
+    "README.md"
+  ],
+  "homepage": "https://glazyr.com",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "browser",
+    "chromium",
+    "ai-agents",
+    "web-automation"
+  ],
+  "license": "MIT",
+  "name": "@glazyr/mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mcpmessenger/glazyr-mcp"
+  },
+  "version": "0.3.2",
+  "mcpName": "io.github.mcpmessenger/glazyr"
+}
