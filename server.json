@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://glazyr.com",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@glazyr/mcp",
-      "version": "0.3.2",
+      "version": "0.3.3",
       "transport": {
         "type": "stdio"
       },
