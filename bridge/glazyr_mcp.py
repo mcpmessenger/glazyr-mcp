@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Glazyr MCP bridge v0.3.2.
+"""Glazyr MCP bridge v0.3.3.
+
+v0.3.3: two resident-mode survival fixes, both about the newest
+clients. (1) The resident daemonizes at startup (fork + setsid):
+some clients (mcporter 0.17.x) retire their whole process tree on
+transport close, and the resident - spawned by the launcher - used
+to sit in that tree and got SIGTERM'd with it, taking page state
+along. Orphaned to init, no client's tree contains it now.
+(2) A protocol shield classifies every raw socket line before the
+MCP SDK sees it: unknown methods (e.g. the new-protocol
+server/discover) get a well-formed JSON-RPC -32601 instead of a
+pydantic validation failure inside the session, unknown
+notifications are dropped, malformed lines get -32700 / -32600,
+and a session that ends in an exception closes only its own
+connection - the resident keeps serving.
 
 v0.3.2: resident mode (--resident) - one bridge per machine serves
 every client over a Unix socket under ~/.glazyr, so per-call clients
@@ -1211,6 +1225,31 @@ def _package_version():
     except Exception:
         return 'unknown'
 
+# The client->server methods MCP SDK 1.30.x understands. Anything
+# outside this set never reaches the SDK validator (see the shield
+# in pump_in inside _run_resident).
+_KNOWN_METHODS = frozenset({
+    'initialize', 'ping',
+    'tools/list', 'tools/call',
+    'prompts/list', 'prompts/get',
+    'resources/list', 'resources/templates/list', 'resources/read',
+    'resources/subscribe', 'resources/unsubscribe',
+    'logging/setLevel', 'completion/complete',
+    'roots/list', 'sampling/createMessage', 'elicitation/create',
+    'tasks/get', 'tasks/result', 'tasks/list', 'tasks/cancel',
+    'notifications/initialized', 'notifications/cancelled',
+    'notifications/progress', 'notifications/roots/list_changed',
+})
+
+
+def _shield_reply(msg_id, code, message):
+    """A well-formed JSON-RPC error line, written straight to the
+    socket by the shield - the SDK never sees the offending line."""
+    return (json.dumps({'jsonrpc': '2.0', 'id': msg_id,
+                        'error': {'code': code, 'message': message}})
+            + '\n').encode()
+
+
 def _run_resident():
     """Single-instance resident bridge: serves MCP sessions over a
     Unix socket under ~/.glazyr, one browsing session shared by every
@@ -1222,6 +1261,18 @@ def _run_resident():
     import anyio
     from mcp.shared.message import SessionMessage
     from mcp.types import CallToolRequest, JSONRPCMessage
+
+    # v0.3.3: daemonize before anything else. The launcher spawns us
+    # as its child; a client that retires its process tree on
+    # transport close (mcporter 0.17.x walks /proc ancestry and
+    # SIGTERMs every descendant of its server process) would take
+    # the resident down with it. Fork: the launcher's direct child
+    # exits immediately, the real resident is orphaned to init / a
+    # subreaper and starts its own session - no client's tree ever
+    # contains it. The instance lock below is taken by the orphan.
+    if os.fork() != 0:
+        os._exit(0)
+    os.setsid()
 
     home = _glazyr_home()
     os.makedirs(home, exist_ok=True)
@@ -1275,6 +1326,38 @@ def _run_resident():
                     line = line.strip()
                     if not line:
                         continue
+                    # v0.3.3 protocol shield: classify the raw line
+                    # before the SDK sees it. Unknown methods (the
+                    # new-protocol server/discover is the famous
+                    # one) used to fail SDK request-model validation
+                    # inside the session; now a request gets a
+                    # well-formed -32601 on the spot, and an unknown
+                    # notification is dropped (JSON-RPC forbids
+                    # answering notifications). Unparseable lines
+                    # get -32700, non-object lines -32600 - both
+                    # with id null, per spec. Known methods and
+                    # responses pass through untouched.
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        writer.write(_shield_reply(
+                            None, -32700, 'Parse error'))
+                        await writer.drain()
+                        continue
+                    if not isinstance(obj, dict):
+                        writer.write(_shield_reply(
+                            None, -32600, 'Invalid Request'))
+                        await writer.drain()
+                        continue
+                    method = obj.get('method')
+                    if method is not None and \
+                            method not in _KNOWN_METHODS:
+                        if 'id' in obj:
+                            writer.write(_shield_reply(
+                                obj.get('id'), -32601,
+                                f'Method not found: {method}'))
+                            await writer.drain()
+                        continue
                     try:
                         msg = JSONRPCMessage.model_validate_json(line)
                     except Exception as exc:
@@ -1303,11 +1386,26 @@ def _run_resident():
             read_recv, write_send,
             mcp._mcp_server.create_initialization_options(),
             raise_exceptions=False))
+
+        # v0.3.3 per-connection guard: a session that ends in an
+        # exception is logged here and closes only its own
+        # connection (the finally below) - never the resident.
+        def _sess_done(fut):
+            if fut.cancelled():
+                return
+            exc = fut.exception()
+            if exc is not None:
+                print(f'[glazyr] session ended with error: {exc!r}',
+                      flush=True)
+        sess.add_done_callback(_sess_done)
         pin = asyncio.ensure_future(pump_in())
         pout = asyncio.ensure_future(pump_out())
         try:
             await asyncio.wait([sess, pin],
                                  return_when=asyncio.FIRST_COMPLETED)
+        except Exception as exc:
+            print(f'[glazyr] connection wait failed: {exc!r}',
+                  flush=True)
         finally:
             for t in (sess, pin, pout):
                 t.cancel()
