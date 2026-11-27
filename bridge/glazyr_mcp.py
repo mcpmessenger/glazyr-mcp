@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Glazyr MCP bridge v0.3.3.
+"""Glazyr MCP bridge v0.3.4.
+
+v0.3.4: Glazyr Trace (TRACE_FORMAT.md v1, Draft v0.4). Every client
+attach is a trace session; reads, write-ahead actions and their
+outcomes (with provenance), invalidations of bridge-asserted state and
+producer freshness transitions are appended to a local hash-chained
+JSONL file under ~/.glazyr/traces. The glazyr_trace tool reads it back
+(summary / tail / failures / url / since / verify / note). Two 0.3.3
+bug fixes ride along: a dead producer's overlay (typed values) no
+longer survives into the fresh browser, and password values are never
+echoed back in peeks (or written to the trace).
 
 v0.3.3: two resident-mode survival fixes, both about the newest
 clients. (1) The resident daemonizes at startup (fork + setsid):
@@ -52,8 +62,12 @@ and state age; find matches heading text and the page title.
 Runs inside WSL on the workstation, next to the browser. The client
 (Claude Code / Codex / any MCP client) spawns it over stdio.
 """
-import fcntl, json, os, struct, subprocess, sys, threading, time, urllib.request
+import contextvars, fcntl, hashlib, itertools, json, os, re, struct, subprocess, sys, threading, time, urllib.request
 from urllib.parse import urlparse
+
+# The bridge's own version - the single source for trace emitter
+# identity (v0.3.4; before, it lived only in the docstring).
+VERSION = '0.3.4'
 
 # FastMCP's settings read .env from the CWD; pin CWD to the bridge dir so
 # any client's working directory can't break startup.
@@ -61,6 +75,16 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glazyr_filter as gf
 from glazyr_filter import cq, T
+
+# Glazyr Trace (v0.3.4). The writer needs a conformant RFC 8785
+# implementation; without it tracing is off (and glazyr_trace says
+# so) - the browser tools are unaffected.
+try:
+    import glazyr_trace as gt
+    _TRACE_UNAVAILABLE = None
+except Exception as _e:  # ImportError for rfc8785, most likely
+    gt = None
+    _TRACE_UNAVAILABLE = f'{type(_e).__name__}: {_e}'
 
 from mcp.server.fastmcp import FastMCP
 
@@ -101,17 +125,27 @@ _state = {
     'producer_died': None,  # v0.3.2: {url, seq, detail} of the last producer death
     'probe_cache': (0.0, None),  # v0.3.2: (checked_at, health dict)
     'resident': None,     # v0.3.2: resident-mode bookkeeping, when resident
+    # v0.3.4 (trace):
+    'epoch': None,        # producer identity of the state in hand ("pid.starttime")
+    'assertions': {},     # (doc_key, dom_id, kind) -> {'n', 'desc'}: overlay entries by asserting action
+    'trace_action': None, # n of the action event currently executing
+    'nav_evidence': None, # how the last _navigate_attempt confirmed its landing
 }
+_last_payload_pid = [None]   # producer pid behind the last read_payload()
 
 # ---------- tokenizer (yardstick; falls back to chars/4) ----------
+# v0.3.4: which branch was taken is recorded at import - every trace
+# token figure names its tokenizer (TRACE_FORMAT: qualified numbers).
 try:
     import tiktoken
     _enc = tiktoken.get_encoding('cl100k_base')
     def count_tokens(s):
         return len(_enc.encode(s))
+    TOKENIZER = 'cl100k'
 except Exception:
     def count_tokens(s):
         return max(1, len(s) // 4)
+    TOKENIZER = 'chars/4'
 
 # ---------- shared memory ----------
 def find_sem():
@@ -143,7 +177,8 @@ def find_sem_fd():
 
 def read_payload():
     """Returns (seq, payload_bytes) or (0, None)."""
-    path = find_sem_fd()
+    path, pid = find_sem()
+    _last_payload_pid[0] = pid
     if not path:
         return 0, None
     f = os.open(path, os.O_RDONLY)
@@ -210,6 +245,8 @@ def refresh_apc():
             _state['prev_sigs'] = _state['sigs']
             _state['overlay'] = {}
             _state['overlay_version'] += 1
+            _trace_drop_all('new_document')
+        _state['epoch'] = _epoch_of(_last_payload_pid[0])
         _state['seq'] = seq
         _state['seq_at'] = time.time()
         _state['apc'] = apc
@@ -308,23 +345,24 @@ def producer_health(force=False):
         return cached
     health = _producer_health_uncached(now)
     _state['probe_cache'] = (now, health)
+    _trace_health(health)
     return health
 
 def _producer_health_uncached(now):
     popen = _state['browser']
     if popen is not None and popen.poll() is not None:
-        return {'status': 'dead',
+        return {'status': 'dead', 'via': 'popen',
                 'detail': f'browser process (pid {popen.pid}) exited '
                           f'with code {popen.returncode}'}
     _path, sem_pid = find_sem()
     if sem_pid is None:
         if _state['seq'] > 0 or _state['apc'] is not None:
-            return {'status': 'dead',
+            return {'status': 'dead', 'via': 'memfd',
                     'detail': 'state region (memfd) is gone - the '
                               'producer process exited'}
-        return {'status': 'none', 'detail': 'no producer yet'}
+        return {'status': 'none', 'via': 'scan', 'detail': 'no producer yet'}
     if not _pid_alive(sem_pid):
-        return {'status': 'dead',
+        return {'status': 'dead', 'via': 'pid',
                 'detail': f'producer process (pid {sem_pid}) is gone'}
     # Producer process lives. An old seq alone is just an idle page
     # (checkpoint 7 honesty); only probe the renderer when the state
@@ -332,12 +370,12 @@ def _producer_health_uncached(now):
     seq_age = now - _state['seq_at'] if _state['seq_at'] else 0
     if _state['seq'] > 0 and seq_age > 45:
         if not _renderer_probe():
-            return {'status': 'dead',
+            return {'status': 'dead', 'via': 'probe',
                     'detail': f'producer (pid {sem_pid}) is alive but '
                               f'its renderer does not answer CDP '
                               f'(seq frozen at {_state["seq"]} for '
                               f'{int(seq_age)}s)'}
-    return {'status': 'live', 'detail': f'producer pid {sem_pid}'}
+    return {'status': 'live', 'via': 'pid', 'detail': f'producer pid {sem_pid}'}
 
 def _guard_state_fresh():
     """Read-path guard (v0.3.2): never serve a dead producer's state
@@ -355,7 +393,7 @@ def _guard_state_fresh():
     died_url, died_seq = _state['page_url'], _state['seq']
     detail = health['detail']
     _state['producer_died'] = {'url': died_url, 'seq': died_seq,
-                               'detail': detail}
+                               'detail': detail, 'via': health.get('via')}
     _state['last_error'] = f'GLAZYR_PRODUCER_DEAD: {detail}'
     # Drop the corpse's state so nothing downstream can serve it.
     _state['apc'] = None
@@ -367,15 +405,438 @@ def _guard_state_fresh():
     _state['page_title'] = ''
     _state['last_served'] = None
     _state['probe_cache'] = (0.0, None)
+    _state['epoch'] = None
+    # v0.3.4 fix: the overlay is the corpse's state too. 0.3.3 kept it,
+    # so the dead browser's typed values / CHECKED marks were applied
+    # by DOM id to whatever unrelated page the fresh browser loaded.
+    _state['overlay'] = {}
+    _state['overlay_version'] += 1
+    _trace_drop_all('producer_dead', detail=detail, always=True)
+    rn = _trace_action('relaunch_browser', cause='bridge_recovery')
     try:
         _force_relaunch()
+        _trace_outcome(rn, 'asserted', status='ok')
     except Exception as e:
         _state['last_error'] += f'; respawn failed: {e}'
+        _trace_outcome(rn, 'asserted', status='error',
+                       error=f'respawn failed: {e}')
     return (f'Glazyr error GLAZYR_PRODUCER_DEAD: the browser died '
             f'({detail}). Its last state (url: {died_url or "(none)"}, '
             f'seq {died_seq}) was NOT served - it is gone, not stale '
             f'content presented as live. A fresh browser has been '
             f'launched; call glazyr_navigate to continue.')
+
+# ---------- Glazyr Trace (v0.3.4) ----------
+# Session identity: one id per client attach (TRACE_FORMAT 5.1). The
+# resident sets it per connection in handle(); the contextvar is
+# inherited by the MCP session task and so by every tool call on that
+# connection. A stdio (per-connection) bridge is one session.
+_session_var = contextvars.ContextVar('glazyr_trace_session', default=None)
+_session_seq = itertools.count(1)
+_tracer_box = {'w': None, 'pid': None}
+_tracer_lock = threading.Lock()
+# Freshness transitions are judged from two threads (tool path and the
+# resident heartbeat); lock order is always _fresh_lock -> writer lock.
+_fresh_lock = threading.Lock()
+_fresh = {'status': None, 'dead_epoch': None}
+# Trace hooks must never change a tool's result: a hook that raises is
+# counted and surfaced in glazyr_trace's footer, and the tool goes on.
+_trace_errors = {'count': 0, 'last': None}
+
+
+def _trace_safe(default=None):
+    def deco(fn):
+        def wrapped(*a, **kw):
+            try:
+                return fn(*a, **kw)
+            except Exception as e:
+                _trace_errors['count'] += 1
+                _trace_errors['last'] = f'{fn.__name__}: {type(e).__name__}: {e}'
+                return default(*a, **kw) if callable(default) else default
+        wrapped.__name__ = fn.__name__
+        wrapped.__doc__ = fn.__doc__
+        return wrapped
+    return deco
+
+# Declared honestly (TRACE_FORMAT 9): only kinds and fields this
+# emitter actually writes. No 'key' action exists in this bridge.
+CAPABILITIES = {
+    'kinds': ['session_start', 'state_read', 'action', 'action_outcome',
+              'invalidation', 'freshness', 'note', 'session_end'],
+    'fields': ['url', 'title', 'scope', 'state.epoch', 'state.seq',
+               'doc_key', 'hashes', 'counts', 'level', 'stub', 'tokens',
+               'read_ms', 'error', 'target.desc', 'target.requested_id',
+               'target.id', 'target.id_scope', 'target.sig', 'value',
+               'value_redacted', 'outcome.navigated', 'outcome.method',
+               'outcome.new_url', 'outcome.new_doc_key', 'outcome.new_state',
+               'outcome.error', 'continues', 'totals'],
+}
+# The current producer never reports form values back, so a fill can
+# never be observed: every type outcome is asserted for its whole life
+# and ends at an invalidation (TRACE_FORMAT 5.4).
+FILLS_OBSERVABLE = False
+
+
+def _instance():
+    return f'glazyr-{os.getpid()}'
+
+
+def _trace_dir():
+    return os.environ.get('GLAZYR_TRACE_DIR') or os.path.join(
+        _glazyr_home(), 'traces')
+
+
+def _trace_off_reason():
+    if gt is None:
+        return f'tracing unavailable ({_TRACE_UNAVAILABLE})'
+    if os.environ.get('GLAZYR_TRACE', '').lower() in ('0', 'off', 'false', 'no'):
+        return 'tracing disabled by GLAZYR_TRACE'
+    return None
+
+
+def _tracer():
+    """The instance's writer, created on first use. Keyed by pid: the
+    resident daemonizes by fork after import, and the forked process
+    is a new emitter instance with its own file."""
+    if _trace_off_reason():
+        return None
+    with _tracer_lock:
+        if _tracer_box['w'] is None or _tracer_box['pid'] != os.getpid():
+            _tracer_box['w'] = gt.TraceWriter(
+                _trace_dir(), _instance(),
+                {'name': 'glazyr-bridge', 'version': VERSION},
+                CAPABILITIES, stack='glazyr', tokenizer=TOKENIZER)
+            _tracer_box['pid'] = os.getpid()
+        return _tracer_box['w']
+
+
+def _new_session_id():
+    return f'{_instance()}.{next(_session_seq)}'
+
+
+def _bridge_session():
+    """Events the bridge emits on its own, outside any client call
+    (heartbeat-detected producer death)."""
+    return f'{_instance()}.bridge'
+
+
+def _cur_session():
+    s = _session_var.get()
+    return s if s is not None else f'{_instance()}.stdio'
+
+
+def _emit(kind, provenance, session=None, **fields):
+    w = _tracer()
+    if w is None:
+        return None
+    return w.append(session or _cur_session(), kind, provenance, fields)
+
+
+def _epoch_of(pid):
+    """Producer identity: pid + kernel start time. Changes iff the seq
+    space resets (a new producer process starts its counter at 1)."""
+    if not pid:
+        return None
+    try:
+        with open(f'/proc/{pid}/stat', 'rb') as f:
+            start = f.read().rsplit(b')', 1)[1].split()[19].decode()
+        return f'{pid}.{start}'
+    except Exception:
+        return None
+
+
+def _doc_key_str(dk):
+    """The producer's document_identifier is a DocumentIdentifier
+    message (not a scalar): its serialized_token is the identity."""
+    if dk is None:
+        return None
+    if isinstance(dk, str):
+        return dk or None
+    tok = getattr(dk, 'serialized_token', None)
+    if tok:
+        return tok
+    try:
+        return dk.SerializeToString().hex() or None
+    except Exception:
+        return None
+
+
+def _state_ref():
+    if _state['seq'] > 0 and _state['epoch']:
+        return {'epoch': _state['epoch'], 'seq': _state['seq']}
+    return None
+
+
+_digest_cache = {'key': None, 'val': None}
+
+
+def _state_digests():
+    """(hashes, counts) for the state in hand. hashes.state covers the
+    canonical (unfiltered, overlay-free, header-free) serialization
+    only - a bridge assertion or a ticking counter never moves it.
+    Computed once per producer state and reused by stub reads."""
+    apc = _state['apc']
+    if apc is None:
+        return None, None
+    key = (_state['epoch'], _state['seq'], id(apc))
+    if _digest_cache['key'] == key:
+        return _digest_cache['val']
+
+    def h(s):
+        return hashlib.sha256(s.encode('utf-8', 'surrogatepass')).hexdigest()
+    text, _st = gf.serialize(apc, 'none', None)
+    strong, weak = set(), set()
+    for s in _state['sigs'].values():
+        (strong if _sig_strong(s) else weak).add(
+            json.dumps(s, sort_keys=True, ensure_ascii=False))
+    counts = {'total': 0, 'links': 0, 'inputs': 0, 'headings': 0}
+    outline = []
+    f = gf.Filter(apc, 'standard')
+
+    def rec(n):
+        counts['total'] += 1
+        t = T.get(n.content_attributes.attribute_type)
+        if t == 'ANCHOR':
+            counts['links'] += 1
+        elif t == 'FORM_CONTROL':
+            counts['inputs'] += 1
+        elif t == 'HEADING':
+            counts['headings'] += 1
+            outline.append(' '.join(f.merged_text(n).split()))
+        for c in n.children_nodes:
+            rec(c)
+    rec(apc.root_node)
+    hashes = {'basis': 'glazyr-apc-raw', 'state': h(text),
+              'structure': h('\n'.join(sorted(strong))),
+              'outline': h('\n'.join(outline)),
+              'weak': h('\n'.join(sorted(weak)))}
+    _digest_cache['key'], _digest_cache['val'] = key, (hashes, counts)
+    return hashes, counts
+
+
+@_trace_safe()
+def _trace_read(scope=None, level=None, stub=False, toks=None,
+                read_ms=None, error=None, provenance='observed'):
+    """Append a state_read for what was just served to the agent."""
+    if _tracer() is None:
+        return None
+    f = {}
+    if scope:
+        f['scope'] = scope
+    if error is not None:
+        f['error'] = error
+        if _state['page_url']:
+            f['url'] = gf.redact_url(_state['page_url'])
+        return _emit('state_read', provenance, **f)
+    # URL only from the state itself; when the header came from the
+    # CDP fallback the read carries no URL rather than an inferred one.
+    if _state['page_url']:
+        f['url'] = gf.redact_url(_state['page_url'])
+    if _state['page_title']:
+        f['title'] = _state['page_title']
+    st = _state_ref()
+    if st:
+        f['state'] = st
+    dk = _doc_key_str(_state['doc_key'])
+    if dk:
+        f['doc_key'] = dk
+    try:
+        hashes, counts = _state_digests()
+    except Exception:
+        hashes, counts = None, None
+    if hashes:
+        f['hashes'] = hashes
+        f['counts'] = counts
+    if level and not scope:
+        f['level'] = level
+    if stub:
+        f['stub'] = True
+    if toks is not None:
+        f['tokens'] = {'count': toks, 'tokenizer': TOKENIZER}
+    if read_ms is not None:
+        f['read_ms'] = read_ms
+    n = _emit('state_read', provenance, **f)
+    _trace_check_recovered(n)
+    return n
+
+
+def _guard_error_provenance():
+    d = _state.get('producer_died') or {}
+    return 'inferred' if d.get('via') == 'probe' else 'observed'
+
+
+@_trace_safe()
+def _trace_check_recovered(n):
+    """recovered is written only after a state_read observes a new
+    epoch - a respawn returning without error is not a recovery."""
+    with _fresh_lock:
+        if _fresh['status'] == 'dead' and _state['epoch'] and \
+                _state['epoch'] != _fresh['dead_epoch']:
+            _emit('freshness', 'observed', status='recovered',
+                  detail=f'state_read n={n} observed producer epoch '
+                         f'{_state["epoch"]} (dead epoch: '
+                         f'{_fresh["dead_epoch"] or "none"})')
+            _fresh['status'] = 'recovered'
+
+
+@_trace_safe()
+def _trace_health(health, session=None):
+    """Freshness on producer_health transitions (TRACE_FORMAT 5.6).
+    A pid-exists 'live' is inferred, never observed. dead -> live is
+    not written: that path goes through 'recovered' on a read."""
+    if _tracer() is None:
+        return
+    status = {'live': 'live', 'dead': 'dead', 'none': 'unknown'}.get(
+        health.get('status'))
+    if status is None:
+        return
+    via = health.get('via')
+    with _fresh_lock:
+        cur = _fresh['status']
+        if status == cur:
+            return
+        if cur in ('dead', 'recovered') and status in ('live', 'unknown'):
+            return
+        if status == 'live':
+            prov = 'inferred'
+        elif status == 'unknown':
+            prov = 'asserted'
+        else:
+            prov = 'inferred' if via == 'probe' else 'observed'
+        if status == 'dead':
+            _fresh['dead_epoch'] = _state['epoch']
+        _emit('freshness', prov, session=session, status=status,
+              detail=health.get('detail'))
+        _fresh['status'] = status
+
+
+@_trace_safe()
+def _heartbeat_producer_check():
+    """Resident heartbeat thread: notice a dead producer between calls
+    without touching _state. Cheap checks only (no CDP): our own
+    browser's exit status, and the producer pid behind the last read."""
+    if _tracer() is None:
+        return
+    popen = _state['browser']
+    if popen is not None and popen.poll() is not None:
+        _trace_health({'status': 'dead', 'via': 'popen',
+                       'detail': f'browser process (pid {popen.pid}) exited '
+                                 f'with code {popen.returncode} (heartbeat)'},
+                      session=_bridge_session())
+        return
+    pid = _last_payload_pid[0]
+    if pid and _state['seq'] > 0 and not _pid_alive(pid):
+        _trace_health({'status': 'dead', 'via': 'pid',
+                       'detail': f'producer process (pid {pid}) is gone '
+                                 f'(heartbeat)'},
+                      session=_bridge_session())
+
+
+@_trace_safe()
+def _trace_action(action, cause='agent', **fields):
+    """Write-ahead: append the action BEFORE performing it."""
+    f = dict(fields)
+    f['action'] = action
+    f['cause'] = cause
+    if 'state' not in f:
+        st = _state_ref()
+        if st:
+            f['state'] = st
+    return _emit('action', 'asserted', **f)
+
+
+@_trace_safe()
+def _trace_outcome(ref, provenance, **outcome):
+    if ref is None:
+        return None
+    return _emit('action_outcome', provenance, ref=ref, outcome=outcome)
+
+
+@_trace_safe(default=lambda node_id, *a, **k: {'desc': f'node {node_id}', 'requested_id': node_id})
+def _trace_target(node_id, real_id=None, node=None):
+    t = {'requested_id': node_id, 'id_scope': 'dom_node_id'}
+    if node is None:
+        t['desc'] = f'node {node_id} (unresolved)'
+        return t
+    t['desc'] = _node_desc(real_id, node)
+    t['id'] = real_id
+    sig = _state['sigs'].get(real_id)
+    if sig:
+        t['sig'] = dict({'scheme': 'glazyr-sig'}, **sig)
+    return t
+
+
+# Assertion index (TRACE_FORMAT 5.5): which action asserted each
+# overlay entry, so an invalidation can name what it dropped by n.
+@_trace_safe()
+def _assert_add(node_id, kind):
+    n = _state['trace_action']
+    if n is None:
+        return
+    key = (_doc_key_str(_state['doc_key']), node_id, kind)
+    old = _state['assertions'].get(key)
+    if old is not None and old['n'] != n:
+        _emit('invalidation', 'asserted', reason='superseded',
+              dropped=[old])
+    _state['assertions'][key] = {
+        'n': n, 'desc': _node_desc(node_id, _state['nodes'].get(node_id))}
+
+
+@_trace_safe()
+def _assert_supersede(node_id, kind):
+    old = _state['assertions'].pop(
+        (_doc_key_str(_state['doc_key']), node_id, kind), None)
+    if old is not None and old['n'] != _state['trace_action']:
+        _emit('invalidation', 'asserted', reason='superseded', dropped=[old])
+
+
+@_trace_safe()
+def _trace_drop_all(reason, detail=None, always=False):
+    """Every outstanding assertion is gone (new document / dead
+    producer). Empty new_document drops are not written (noise);
+    a producer death always is."""
+    seen, dropped = set(), []
+    for v in _state['assertions'].values():
+        if v['n'] not in seen:
+            seen.add(v['n'])
+            dropped.append(dict(v))
+    _state['assertions'] = {}
+    if not dropped and not always:
+        return None
+    f = {'reason': reason, 'dropped': sorted(dropped, key=lambda d: d['n'])}
+    if detail:
+        f['detail'] = detail
+    prov = _guard_error_provenance() if reason == 'producer_dead' else 'observed'
+    return _emit('invalidation', prov, **f)
+
+
+def _is_credential(node):
+    a = node.content_attributes
+    if T.get(a.attribute_type) != 'FORM_CONTROL':
+        return False
+    return gf.is_credential_control(a.form_control_data)
+
+
+@_trace_safe()
+def _nav_outcome(ref, old_doc):
+    """action_outcome for a confirmed navigate, under the 5.4 honesty
+    rules: doc_key change = observed; host/URL comparison = inferred;
+    no evidence at all = navigated "unknown", never true."""
+    ev = _state['nav_evidence'] or {}
+    new_doc = _state['doc_key']
+    doc_changed = new_doc is not None and new_doc != old_doc
+    how = ev.get('how')
+    if how == 'url' and doc_changed:
+        nav, prov = True, 'observed'
+    elif how in ('url', 'doc_host'):
+        nav, prov = True, 'inferred'
+    else:
+        nav, prov = 'unknown', 'inferred'
+    return _trace_outcome(ref, prov, status='ok', navigated=nav,
+                          new_url=gf.redact_url(_state['page_url']) or None,
+                          new_doc_key=_doc_key_str(new_doc) if doc_changed else None,
+                          new_state=_state_ref())
+
 
 # ---------- browser + CDP ----------
 def _kill_shells():
@@ -524,7 +985,7 @@ def page_info():
 def _header():
     url, title = page_info()
     if url:
-        return f'# url: {url}' + (f' | title: {title}' if title else '')
+        return f'# url: {gf.redact_url(url)}' + (f' | title: {title}' if title else '')
     return ''
 
 def _footer(toks, read_ms, level):
@@ -534,9 +995,13 @@ def _footer(toks, read_ms, level):
 def do_peek(level='standard', force=False):
     ensure_browser()
     if not refresh_apc():
-        return 'Glazyr: no page state yet. Navigate somewhere first.'
+        msg = 'Glazyr: no page state yet. Navigate somewhere first.'
+        _trace_read(level=level, error=msg)
+        return msg
     err = _guard_state_fresh()
     if err:
+        _trace_read(level=level, error=err,
+                    provenance=_guard_error_provenance())
         return err
     key = (_state['seq'], level, _state['overlay_version'])
     if not force and level != 'none' and _state['last_served'] == key:
@@ -545,6 +1010,7 @@ def do_peek(level='standard', force=False):
                 f'identical to the previous read. Pass force=true to resend.')
         toks = count_tokens(stub)
         _state['tokens_served'] += toks
+        _trace_read(level=level, stub=True, toks=toks)
         return stub + f'\n# glazyr tokens_this_read={toks} tokens_served_total={_state["tokens_served"]}'
     t0 = time.perf_counter()
     overlay = _state['overlay'] if level != 'none' else None
@@ -559,6 +1025,7 @@ def do_peek(level='standard', force=False):
     if level != 'none':
         _state['last_served'] = key
         _mark_served()
+    _trace_read(level=level, toks=toks, read_ms=read_ms)
     return text + '\n' + _footer(toks, read_ms, level)
 
 def page_summary():
@@ -603,6 +1070,7 @@ def page_summary():
     _state['tokens_served'] += toks
     _state['reads'] += 1
     _mark_served()
+    _trace_read(scope='summary', toks=toks, read_ms=read_ms)
     return text + '\n' + _footer(toks, read_ms, 'summary')
 
 def _rematch(sig, stale_id):
@@ -661,6 +1129,7 @@ def _node_desc(node_id, node):
 def _overlay_set(node_id, kind, annotation):
     _state['overlay'].setdefault(node_id, {})[kind] = annotation
     _state['overlay_version'] += 1
+    _assert_add(node_id, kind)   # v0.3.4: assertion index
 
 def _mark_served():
     """Record the current state as one the agent has seen - the intent
@@ -707,15 +1176,18 @@ def _click_with_fallback(node, node_id):
       2. DOM click: resolve node to its DOM element and invoke HTMLElement.click().
       3. Form submit: if node is a submit control inside a form and step 2 somehow no-ops,
          call form.requestSubmit() on the owning form.
-    Returns None on success, or an informative error string naming what was tried."""
+    Returns (error, method): (None, 'mouse' | 'dom_click' | 'form_submit')
+    on success - the method that actually effected the click (v0.3.4,
+    for the trace outcome) - or (an informative error string naming
+    what was tried, None)."""
     normal_err = _click_node(node)
     if normal_err is None:
-        return None
+        return None, 'mouse'
 
     # Geometry lookup failed or zero box. Enter fallback chain.
     real_id = node.content_attributes.common_ancestor_dom_node_id
     if not real_id:
-        return 'node has no geometry to click and no DOM id to resolve'
+        return 'node has no geometry to click and no DOM id to resolve', None
 
     # Resolve node to its DOM element via CDP
     cdp('DOM.enable')
@@ -724,7 +1196,7 @@ def _click_with_fallback(node, node_id):
     if 'error' in res or not res.get('result', {}).get('object', {}).get('objectId'):
         err_msg = res.get('error', {}).get('message', 'not found')
         return (f'target node {node_id} (DOM {real_id}) no longer resolves in the page '
-                f'at click time ({err_msg}); peek again and use a fresh id')
+                f'at click time ({err_msg}); peek again and use a fresh id'), None
 
     oid = res['result']['object']['objectId']
 
@@ -777,7 +1249,7 @@ def _click_with_fallback(node, node_id):
             cdp('Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': x, 'y': y})
             cdp('Input.dispatchMouseEvent', {'type': 'mousePressed', 'x': x, 'y': y, 'button': 'left', 'clickCount': 1})
             cdp('Input.dispatchMouseEvent', {'type': 'mouseReleased', 'x': x, 'y': y, 'button': 'left', 'clickCount': 1})
-            return None
+            return None, 'mouse'
 
     if scroll_err:
         scroll_fail_desc = f'scroll error: {scroll_err}'
@@ -856,7 +1328,7 @@ def _click_with_fallback(node, node_id):
     if not isinstance(s2_data, dict):
         ex = call2.get('result', {}).get('exceptionDetails', {}).get('exception', {}).get('description')
         err_msg = ex or call2.get('error', {}).get('message', 'DOM click evaluation failed')
-        return f'no geometry; scroll+retry failed ({scroll_fail_desc}); DOM click raised {err_msg}'
+        return f'no geometry; scroll+retry failed ({scroll_fail_desc}); DOM click raised {err_msg}', None
 
     click_ok = s2_data.get('clickOk', False)
     click_err = s2_data.get('clickErr')
@@ -867,14 +1339,16 @@ def _click_with_fallback(node, node_id):
     form_submit_err = s2_data.get('formSubmitErr')
 
     if click_ok or form_submit_ok:
-        return None
+        # requestSubmit only runs when click() did not fire the form's
+        # submit - so a form submit, when it ran, is what effected it.
+        return None, ('form_submit' if form_submit_ok else 'dom_click')
 
     errors = [f'no geometry; scroll+retry failed ({scroll_fail_desc})']
     if click_err:
         errors.append(f'DOM click raised {click_err}')
     if has_form and is_submit and form_submit_err:
         errors.append(f'form submit raised {form_submit_err}')
-    return '; '.join(errors)
+    return '; '.join(errors), None
 
 @mcp.tool()
 def glazyr_status() -> str:
@@ -954,10 +1428,14 @@ def glazyr_peek_subtree(node_id: int, level: str = 'standard') -> str:
     ensure_browser()
     err = _guard_state_fresh()
     if err:
+        _trace_read(scope='subtree', error=err,
+                    provenance=_guard_error_provenance())
         return err
     node, note = resolve_node(node_id)
     if node is None:
-        return note or f'Glazyr: node {node_id} not in current page state. Peek again.'
+        msg = note or f'Glazyr: node {node_id} not in current page state. Peek again.'
+        _trace_read(scope='subtree', error=msg)
+        return msg
     t0 = time.perf_counter()
     overlay = _state['overlay'] if level != 'none' else None
     text, _st = gf.serialize_subtree(_state['apc'], node, level, overlay)
@@ -970,6 +1448,8 @@ def glazyr_peek_subtree(node_id: int, level: str = 'standard') -> str:
         text += '\n' + note
     toks = count_tokens(text)
     _state['tokens_served'] += toks
+    _trace_read(scope='subtree', toks=toks, read_ms=read_ms,
+                provenance='inferred' if note else 'observed')
     return text + '\n' + _footer(toks, read_ms, level)
 
 @mcp.tool()
@@ -982,9 +1462,13 @@ def glazyr_find(query: str, limit: int = 20) -> str:
     the whole page."""
     ensure_browser()
     if not refresh_apc():
-        return 'Glazyr: no page state yet. Navigate somewhere first.'
+        msg = 'Glazyr: no page state yet. Navigate somewhere first.'
+        _trace_read(scope='find', error=msg)
+        return msg
     err = _guard_state_fresh()
     if err:
+        _trace_read(scope='find', error=err,
+                    provenance=_guard_error_provenance())
         return err
     t0 = time.perf_counter()
     matches = gf.find_nodes(_state['apc'], query, limit)
@@ -1004,6 +1488,7 @@ def glazyr_find(query: str, limit: int = 20) -> str:
     text = '\n'.join(l for l in lines if l)
     toks = count_tokens(text)
     _state['tokens_served'] += toks
+    _trace_read(scope='find', toks=toks, read_ms=read_ms)
     return text + '\n' + _footer(toks, read_ms, 'find')
 
 def _url_eq(a, b):
@@ -1019,7 +1504,11 @@ def _navigate_attempt(url, wait_s=45):
     from the PREVIOUS page can satisfy the seq wait with the wrong
     document, so confirmation requires a new document on the target
     host, or the state URL already being the target (same-document
-    and anchor navigations create no new document)."""
+    and anchor navigations create no new document).
+
+    v0.3.4: which test confirmed the landing is recorded in
+    _state['nav_evidence'] for the trace outcome's provenance."""
+    _state['nav_evidence'] = None
     refresh_apc()
     old_seq = _state['seq']
     old_doc = _state['doc_key']
@@ -1031,14 +1520,25 @@ def _navigate_attempt(url, wait_s=45):
     while True:
         refresh_apc()
         if _url_eq(_state['page_url'], url):
+            _state['nav_evidence'] = {'how': 'url', 'old_doc': old_doc}
             return True
         cur_host = urlparse(_state['page_url']).hostname
-        if _state['doc_key'] is None or \
-                (_state['doc_key'] != old_doc and cur_host == target_host):
+        if _state['doc_key'] is None:
+            _state['nav_evidence'] = {'how': 'no_doc_key', 'old_doc': old_doc}
+            return True
+        if _state['doc_key'] != old_doc and cur_host == target_host:
+            _state['nav_evidence'] = {'how': 'doc_host', 'old_doc': old_doc}
             return True
         if time.time() >= deadline:
             return False
         time.sleep(0.25)
+
+def _nav_try(url, ref, wait_s=45):
+    """One traced navigate attempt: (landed, error_text)."""
+    try:
+        return _navigate_attempt(url, wait_s=wait_s), None
+    except Exception as e:
+        return False, f'{type(e).__name__}: {e}'
 
 @mcp.tool()
 def glazyr_navigate(url: str, level: str = 'standard', full: bool = False) -> str:
@@ -1056,31 +1556,45 @@ def glazyr_navigate(url: str, level: str = 'standard', full: bool = False) -> st
     page as if the navigation had succeeded."""
     ensure_browser()
     recovered = False
-    try:
-        landed = _navigate_attempt(url)
-    except Exception:
-        landed = False
+    ref = _trace_action('navigate', url=gf.redact_url(url))
+    landed, exc = _nav_try(url, ref)
     if not landed:
         _state['last_error'] = (
             f'navigate to {url} unconfirmed (state still shows '
             f'{_state["page_url"] or "(none)"}); relaunched the '
             f'browser and retried')
-        _force_relaunch()
-        recovered = True
+        # A landing not seen within the wait is concluded from a
+        # timeout: inferred, every time (TRACE_FORMAT 5.4).
+        _trace_outcome(ref, 'asserted' if exc else 'inferred',
+                       status='error',
+                       error=exc or (f'navigate to {url} unconfirmed (state '
+                                     f'still shows '
+                                     f'{_state["page_url"] or "(none)"})'))
+        rn = _trace_action('relaunch_browser', cause='bridge_recovery')
         try:
-            landed = _navigate_attempt(url, wait_s=30)
-        except Exception:
-            landed = False
+            _force_relaunch()
+        except Exception as e:
+            _trace_outcome(rn, 'asserted', status='error',
+                           error=f'{type(e).__name__}: {e}')
+            raise
+        _trace_outcome(rn, 'asserted', status='ok')
+        recovered = True
+        ref = _trace_action('navigate', cause='bridge_recovery', url=gf.redact_url(url))
+        landed, exc = _nav_try(url, ref, wait_s=30)
         if not landed:
             _state['last_error'] = (
                 f'navigate to {url} failed after a browser relaunch; '
                 f'state shows {_state["page_url"] or "(none)"}')
-            return (f'Glazyr: navigation to {url} did not land. The '
-                    f'browser was relaunched and the navigation '
-                    f'retried, but the state channel still shows '
-                    f'{_state["page_url"] or "(no page)"}. Nothing '
-                    f'from the wrong page was served. Check '
-                    f'glazyr_status and try again.')
+            msg = (f'Glazyr: navigation to {url} did not land. The '
+                   f'browser was relaunched and the navigation '
+                   f'retried, but the state channel still shows '
+                   f'{_state["page_url"] or "(no page)"}. Nothing '
+                   f'from the wrong page was served. Check '
+                   f'glazyr_status and try again.')
+            _trace_outcome(ref, 'asserted' if exc else 'inferred',
+                           status='error', error=exc or msg)
+            return msg
+    _nav_outcome(ref, (_state['nav_evidence'] or {}).get('old_doc'))
     if full:
         out = do_peek(level, force=True)
     else:
@@ -1099,63 +1613,104 @@ def glazyr_click(node_id: int, level: str = 'standard') -> str:
     ensure_browser()
     err = _guard_state_fresh()
     if err:
+        ref = _trace_action('click', target=_trace_target(node_id))
+        _trace_outcome(ref, _guard_error_provenance(), status='error', error=err)
         return err
     node, note = resolve_node(node_id)
     if node is None:
-        return note or f'Glazyr: node {node_id} not in current page state. Peek again.'
+        msg = note or f'Glazyr: node {node_id} not in current page state. Peek again.'
+        ref = _trace_action('click', target=_trace_target(node_id))
+        _trace_outcome(ref, 'observed', status='error', error=msg)
+        return msg
     real_id = node.content_attributes.common_ancestor_dom_node_id
     old_seq = _state['seq']
     old_doc = _state['doc_key']
-    err = _click_with_fallback(node, node_id)
-    if err:
-        return f'Glazyr: node {node_id}: {err}.'
-    # Bridge-asserted overlay for form controls: radios/checkboxes get a
-    # CHECKED annotation the agent can see in the next peek (the producer
-    # itself only writes state on navigation). v0.2.2: the asserted
-    # delta also rides in the ack itself, so verifying a click no longer
-    # costs a peek round-trip; checkboxes toggle honestly.
-    delta = None
-    a = node.content_attributes
-    if T.get(a.attribute_type) == 'FORM_CONTROL':
-        fc = a.form_control_data
-        fct = cq.FormControlType.Name(fc.form_control_type)
-        if 'RADIO' in fct:
-            for oid, osig in list(_state['sigs'].items()):
-                if osig.get('name') == fc.field_name and 'RADIO' in osig.get('fctype', ''):
-                    if oid in _state['overlay']:
-                        _state['overlay'][oid].pop('checked', None)
-            _overlay_set(real_id, 'checked', 'CHECKED (bridge-asserted)')
-            delta = 'asserted CHECKED'
-        elif 'CHECKBOX' in fct:
-            if fc.is_checked:
-                _overlay_set(real_id, 'checked', 'UNCHECKED (bridge-asserted)')
-                delta = 'asserted UNCHECKED'
-            else:
+    # Write-ahead: the click exists in the record before it happens.
+    ref = _trace_action('click', target=_trace_target(node_id, real_id, node))
+    # A re-matched stale id caps the outcome at inferred (5.3/5.4).
+    cap = 'inferred' if real_id != node_id else 'observed'
+    _state['trace_action'] = ref
+    try:
+        try:
+            err, method = _click_with_fallback(node, node_id)
+        except Exception as e:
+            _trace_outcome(ref, 'asserted', status='error',
+                           error=f'{type(e).__name__}: {e}')
+            raise
+        if err:
+            msg = f'Glazyr: node {node_id}: {err}.'
+            _trace_outcome(ref, 'asserted', status='error', error=msg)
+            return msg
+        # Bridge-asserted overlay for form controls: radios/checkboxes get a
+        # CHECKED annotation the agent can see in the next peek (the producer
+        # itself only writes state on navigation). v0.2.2: the asserted
+        # delta also rides in the ack itself, so verifying a click no longer
+        # costs a peek round-trip; checkboxes toggle honestly.
+        delta = None
+        a = node.content_attributes
+        if T.get(a.attribute_type) == 'FORM_CONTROL':
+            fc = a.form_control_data
+            fct = cq.FormControlType.Name(fc.form_control_type)
+            if 'RADIO' in fct:
+                for oid, osig in list(_state['sigs'].items()):
+                    if osig.get('name') == fc.field_name and 'RADIO' in osig.get('fctype', ''):
+                        if oid in _state['overlay']:
+                            _state['overlay'][oid].pop('checked', None)
+                            _assert_supersede(oid, 'checked')
                 _overlay_set(real_id, 'checked', 'CHECKED (bridge-asserted)')
                 delta = 'asserted CHECKED'
-    is_anchor = T.get(a.attribute_type) == 'ANCHOR'
-    is_submit = False
-    if T.get(a.attribute_type) == 'FORM_CONTROL':
-        fc = a.form_control_data
-        fct = cq.FormControlType.Name(fc.form_control_type)
-        if 'SUBMIT' in fct:
-            is_submit = True
+            elif 'CHECKBOX' in fct:
+                if fc.is_checked:
+                    _overlay_set(real_id, 'checked', 'UNCHECKED (bridge-asserted)')
+                    delta = 'asserted UNCHECKED'
+                else:
+                    _overlay_set(real_id, 'checked', 'CHECKED (bridge-asserted)')
+                    delta = 'asserted CHECKED'
+            elif 'BUTTON' in fct:
+                # A button click is an assertion for the pending-fills
+                # view (5.5); index it so the next new document or a
+                # producer death names it as dropped.
+                _assert_add(real_id, 'click')
+        is_anchor = T.get(a.attribute_type) == 'ANCHOR'
+        is_submit = False
+        if T.get(a.attribute_type) == 'FORM_CONTROL':
+            fc = a.form_control_data
+            fct = cq.FormControlType.Name(fc.form_control_type)
+            if 'SUBMIT' in fct:
+                is_submit = True
 
-    # Navigation = a new document. A same-document producer rewrite
-    # (state refreshed, same identifier) is not a navigation.
-    # For navigations (anchors/submits), continue waiting if a same-document
-    # write arrived before the new document landed.
-    deadline = time.time() + (12 if (is_anchor or is_submit) else 2.5)
-    changed = False
-    while time.time() < deadline:
-        wait_for_new_seq(_state['seq'], timeout=max(0.5, deadline - time.time()))
-        changed = (_state['doc_key'] != old_doc) if old_doc is not None \
-            else (_state['seq'] != old_seq)
-        if changed or not (is_anchor or is_submit):
-            break
+        # Navigation = a new document. A same-document producer rewrite
+        # (state refreshed, same identifier) is not a navigation.
+        # For navigations (anchors/submits), continue waiting if a same-document
+        # write arrived before the new document landed.
+        deadline = time.time() + (12 if (is_anchor or is_submit) else 2.5)
+        changed = False
+        while time.time() < deadline:
+            wait_for_new_seq(_state['seq'], timeout=max(0.5, deadline - time.time()))
+            changed = (_state['doc_key'] != old_doc) if old_doc is not None \
+                else (_state['seq'] != old_seq)
+            if changed or not (is_anchor or is_submit):
+                break
+    finally:
+        _state['trace_action'] = None
+    new_doc = _state['doc_key']
     if changed:
+        if new_doc is not None and new_doc != old_doc:
+            _trace_outcome(ref, gt.weakest('observed', cap) if gt else cap,
+                           status='ok', navigated=True, method=method,
+                           new_url=gf.redact_url(_state['page_url']) or None,
+                           new_doc_key=_doc_key_str(new_doc),
+                           new_state=_state_ref())
+        else:
+            # seq moved but no document identity to prove a navigation.
+            _trace_outcome(ref, 'inferred', status='ok', navigated='unknown',
+                           method=method, new_state=_state_ref())
         out = do_peek(level, force=True)
         return (note + '\n' + out) if note else out
+    # No new document within the wait: a timeout-based "false" is
+    # inferred; any CHECKED delta is a bridge assertion on top.
+    _trace_outcome(ref, 'inferred', status='ok', navigated=False,
+                   method=method)
     ack = (f'Glazyr: clicked {_node_desc(real_id, node)}'
            + (f' → {delta} (bridge-asserted)' if delta else '')
            + f'. No navigation followed; page state unchanged '
@@ -1171,22 +1726,62 @@ def glazyr_click(node_id: int, level: str = 'standard') -> str:
 @mcp.tool()
 def glazyr_type(node_id: int, text: str) -> str:
     """Focus the element with the given node id and type text into it.
-    The value is annotated (bridge-asserted) in subsequent peeks."""
+    The value is annotated (bridge-asserted) in subsequent peeks.
+    Values typed into password (credential) fields are never echoed
+    back - the annotation and the ack carry a redaction marker."""
     ensure_browser()
     err = _guard_state_fresh()
     if err:
+        # Field kind unknown here: redact (the safe direction).
+        ref = _trace_action('type', target=_trace_target(node_id),
+                            value_redacted=True)
+        _trace_outcome(ref, _guard_error_provenance(), status='error', error=err)
         return err
     node, note = resolve_node(node_id)
     if node is None:
-        return note or f'Glazyr: node {node_id} not in current page state. Peek again.'
+        msg = note or f'Glazyr: node {node_id} not in current page state. Peek again.'
+        ref = _trace_action('type', target=_trace_target(node_id),
+                            value_redacted=True)
+        _trace_outcome(ref, 'observed', status='error', error=msg)
+        return msg
     real_id = node.content_attributes.common_ancestor_dom_node_id
-    err = _click_node(node)
-    if err:
-        return f'Glazyr: node {node_id}: {err}.'
-    cdp('Input.insertText', {'text': text})
-    _overlay_set(real_id, 'value', f'value={text!r} (bridge-asserted)')
+    secret = _is_credential(node)
+    if secret:
+        ref = _trace_action('type', target=_trace_target(node_id, real_id, node),
+                            value_redacted=True)
+    else:
+        ref = _trace_action('type', target=_trace_target(node_id, real_id, node),
+                            value=text)
+    _state['trace_action'] = ref
+    try:
+        try:
+            err = _click_node(node)
+            if err:
+                msg = f'Glazyr: node {node_id}: {err}.'
+                _trace_outcome(ref, 'asserted', status='error', error=msg)
+                return msg
+            cdp('Input.insertText', {'text': text})
+        except Exception as e:
+            _trace_outcome(ref, 'asserted', status='error',
+                           error=f'{type(e).__name__}: {e}')
+            raise
+        if secret:
+            # v0.3.4 fix: never echo a credential value back (0.3.3
+            # embedded value={text!r} verbatim and served it in every
+            # later peek and find).
+            shown = f'<redacted: {len(text)} chars, credential field>'
+            _overlay_set(real_id, 'value', f'value={shown} (bridge-asserted)')
+        else:
+            shown = repr(text)
+            _overlay_set(real_id, 'value', f'value={text!r} (bridge-asserted)')
+    finally:
+        _state['trace_action'] = None
+    # The producer never reports form values back: a fill stays
+    # asserted for its whole life (FILLS_OBSERVABLE is False).
+    _trace_outcome(ref, 'inferred' if real_id != node_id else 'asserted',
+                   status='ok')
     ack = (f'Glazyr: typed {len(text)} chars into {_node_desc(real_id, node)} '
-           f'→ value={text!r} (bridge-asserted). Page state confirms it '
+           f'→ value={shown} (bridge-asserted). Page state confirms it '
            f'after the next navigation.')
     if note:
         ack = note + '\n' + ack
@@ -1203,14 +1798,114 @@ def glazyr_scroll(direction: str = 'down', amount: int = 600,
     old_seq = _state['seq']
     old_doc = _state['doc_key']
     dy = amount if direction == 'down' else -amount
-    cdp('Input.dispatchMouseEvent', {'type': 'mouseWheel', 'x': 400, 'y': 300, 'deltaX': 0, 'deltaY': dy})
+    ref = _trace_action('scroll', direction='down' if dy >= 0 else 'up',
+                        amount=abs(dy))
+    try:
+        cdp('Input.dispatchMouseEvent', {'type': 'mouseWheel', 'x': 400, 'y': 300, 'deltaX': 0, 'deltaY': dy})
+    except Exception as e:
+        _trace_outcome(ref, 'asserted', status='error',
+                       error=f'{type(e).__name__}: {e}')
+        raise
     wait_for_new_seq(old_seq, timeout=5)
     changed = (_state['doc_key'] != old_doc) if old_doc is not None \
         else (_state['seq'] != old_seq)
+    _trace_outcome(ref, 'asserted', status='ok', new_state=_state_ref())
     out = do_peek(level, force=changed)
     if not changed:
         out += '\n# note: scroll did not trigger a state refresh in v0 (producer writes on load); geometry in the previous state remains valid for clicks.'
     return out
+
+# ---------- trace reader tool (v0.3.4) ----------
+def _live_probe():
+    """The running producer's (epoch, seq), read from the shared-memory
+    header without parsing or touching _state; None if no producer."""
+    path, pid = find_sem()
+    if not path:
+        return None
+    try:
+        f = os.open(path, os.O_RDONLY)
+        try:
+            hdr = os.pread(f, HDR, 0)
+        finally:
+            os.close(f)
+        magic, _ver, seq, _dsize = struct.unpack_from('<IIQI', hdr, 0)
+        if magic != 0x53454D41:
+            return None
+    except Exception:
+        return None
+    return {'epoch': _epoch_of(pid), 'seq': seq}
+
+def _resolve_trace_file(file):
+    if not file:
+        return None
+    if not file.endswith(gt.TRACE_SUFFIX):
+        raise ValueError(f'not a trace file (expected *{gt.TRACE_SUFFIX}): {file}')
+    return file if os.path.isabs(file) else os.path.join(_trace_dir(), file)
+
+@mcp.tool()
+def glazyr_trace(mode: str = 'summary', file: str = '', session: str = '',
+                 url: str = '', since: int | None = None, limit: int = 0,
+                 text: str = '', label: str = '') -> str:
+    """Read this session's Glazyr Trace (a local, hash-chained record of
+    reads, actions, outcomes and their provenance). Cheap by design:
+    use it instead of re-reading pages.
+    mode: summary (default) | tail (resume: goal, any INTERRUPTED
+    action, position, live-vs-trace state, pending fills, last
+    actions) | failures | url (needs url=) | since (needs since=<n>:
+    what changed after event n) | verify (chain report) | note
+    (records text= as your goal/subgoal/observation; label= goal |
+    subgoal | observation). file= reads another trace (e.g. a dead
+    session's, to resume it); session= restricts to one session
+    ('*' = all). Every response ends with its own token cost, the
+    chain head hash and chain status."""
+    off = _trace_off_reason()
+    w = _tracer()
+    mode = (mode or 'summary').strip().lower()
+    if mode == 'note':
+        if off:
+            return f'Glazyr trace: {off}; note not recorded.'
+        if not text.strip():
+            return 'Glazyr trace: note mode needs text=<your goal or observation>.'
+        n = _emit('note', 'asserted', cause='agent', text=text,
+                  label=label or None)
+        if n is None:
+            return f'Glazyr trace: writer disabled ({w.disabled}); note not recorded.'
+        body = f'# glazyr_trace note\nrecorded note n={n}' + \
+               (f' (label={label})' if label else '')
+        foot = (f'# trace: {os.path.basename(w.path)} · head: {w.head}\n'
+                f'# chain: ok as written by this writer (mode="verify" '
+                f're-checks the file)')
+        toks = count_tokens(body + '\n' + foot)
+        return f'{body}\n{foot}\n# cost: {toks} tokens ({TOKENIZER})'
+    if gt is None:
+        return f'Glazyr trace: {off}.'
+    try:
+        path = _resolve_trace_file(file)
+    except ValueError as e:
+        return f'Glazyr trace: {e}'
+    note = None
+    if off:
+        note = off
+    elif w is not None and w.disabled:
+        note = f'writer disabled ({w.disabled}) - this file stops at the failure'
+    if _trace_errors['count']:
+        note = ((note + '; ') if note else '') + (
+            f'trace emitter errors this instance: {_trace_errors["count"]} '
+            f'(last: {_trace_errors["last"]}) - events may be missing')
+    if path is None:
+        path = w.path if (w is not None and w.path) else None
+        if path is None:
+            pred = gt.find_predecessor(_trace_dir())
+            hint = (f' Most recent trace from an earlier instance: '
+                    f'{os.path.basename(pred)} (pass file= to read it).'
+                    if pred else '')
+            return (f'Glazyr trace: this bridge instance has written no events '
+                    f'yet, so it has no trace file.{hint}')
+    return gt.build_view(path, mode=mode, caller=_cur_session(),
+                         session=session, url=url, since=since,
+                         limit=limit or None,
+                         live_probe=_live_probe, count_tokens=count_tokens,
+                         tokenizer=TOKENIZER, writer_note=note)
 
 # ---------- resident mode (v0.3.2) ----------
 def _glazyr_home():
@@ -1314,6 +2009,14 @@ def _run_resident():
         res['connections'] += 1
         res['sessions'] += 1
         touch()
+        # v0.3.4: one trace session per client attach. Set before the
+        # session task is created so the task (and every tool call it
+        # runs) inherits it. session_start is written lazily, on the
+        # session's first event, so the launcher's health probes
+        # (connect + hang up) leave no trace.
+        sid = _new_session_id()
+        _session_var.set(sid)
+        sess_error = []
         read_send, read_recv = anyio.create_memory_object_stream(100)
         write_send, write_recv = anyio.create_memory_object_stream(100)
 
@@ -1395,6 +2098,7 @@ def _run_resident():
                 return
             exc = fut.exception()
             if exc is not None:
+                sess_error.append(exc)
                 print(f'[glazyr] session ended with error: {exc!r}',
                       flush=True)
         sess.add_done_callback(_sess_done)
@@ -1415,6 +2119,11 @@ def _run_resident():
                 pass
             res['connections'] -= 1
             touch()
+            # Courtesy marker only (nothing may depend on it). A bridge
+            # cannot know whether the task finished: agent_exit / error.
+            w = _tracer()
+            if w is not None:
+                w.session_end(sid, 'error' if sess_error else 'agent_exit')
 
     async def main():
         try:
@@ -1440,6 +2149,12 @@ def _run_resident():
                 try:
                     with open(hb_path, 'w') as f:
                         f.write(str(time.time()))
+                except Exception:
+                    pass
+                # v0.3.4: freshness between calls - shares the trace
+                # writer lock with the tool path.
+                try:
+                    _heartbeat_producer_check()
                 except Exception:
                     pass
                 res = _state['resident']
@@ -1478,4 +2193,12 @@ if __name__ == '__main__':
     if '--resident' in sys.argv:
         _run_resident()
     else:
-        mcp.run()
+        # A per-connection (stdio) bridge is one client attach: one
+        # trace session for the life of the process.
+        _session_var.set(f'{_instance()}.stdio')
+        try:
+            mcp.run()
+        finally:
+            _w = _tracer() if _tracer_box['w'] is not None else None
+            if _w is not None:
+                _w.session_end(_cur_session(), 'agent_exit')

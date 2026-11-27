@@ -8,7 +8,7 @@ Glazyr is a patched Chromium whose page-content producer writes the page's
 semantic tree directly into shared memory. An external process reads that
 state in microseconds — no CDP round-trip, no accessibility-tree dump, no
 screenshot guessing. The MCP bridge curates the tree for token cost and
-exposes it to agents as nine tools.
+exposes it to agents as ten tools.
 
 ## How it works
 
@@ -98,7 +98,7 @@ startup is silent and the browser launches and manages itself.
 
 macOS builds do not exist yet.
 
-## The nine tools
+## The ten tools
 
 | Tool | What it does |
 | --- | --- |
@@ -111,6 +111,7 @@ macOS builds do not exist yet.
 | `glazyr_click` | Click by node id, using layout geometry from the browser itself |
 | `glazyr_type` | Focus an element and type |
 | `glazyr_scroll` | Scroll the viewport |
+| `glazyr_trace` | Read the session's local, hash-chained trace (summary, resume tail, failures, verify); see TRACE_FORMAT.md |
 
 Repeat reads of unchanged state return a short stub instead of the full
 payload. Click and type acknowledgments carry their asserted result
@@ -132,4 +133,5 @@ inline.
   Copyright The Chromium Authors). This package's launcher and bridge
   code are MIT-licensed.
 - Environment overrides: `GLAZYR_HOME` (install root), `GLAZYR_SHELL`
-  (use your own build), `GLAZYR_BUNDLE_URL` (bundle mirror).
+  (use your own build), `GLAZYR_BUNDLE_URL` (bundle mirror),
+  `GLAZYR_TRACE=off` (disable the trace), `GLAZYR_TRACE_DIR` (trace location).

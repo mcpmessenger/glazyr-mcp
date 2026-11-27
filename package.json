@@ -26,6 +26,6 @@
     "type": "git",
     "url": "https://github.com/mcpmessenger/glazyr-mcp"
   },
-  "version": "0.3.3",
+  "version": "0.3.4",
   "mcpName": "io.github.mcpmessenger/glazyr"
 }

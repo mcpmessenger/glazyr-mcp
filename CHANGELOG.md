@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.4 - unreleased (branch 0.3.4)
+
+Glazyr Trace, per TRACE_FORMAT.md (Draft v0.4, copied into this repo
+with its conformance fixtures). Bridge and launcher only; the browser
+bundle (0.3.0) is unchanged and no producer changes were made.
+
+- Trace writer: every client attach is a trace session. Reads
+  (`state_read`, with `scope` for summary / find / subtree), write-ahead
+  `action` events and their `action_outcome` (with provenance under the
+  section 5.4 honesty rules), `invalidation` of bridge-asserted state,
+  and `freshness` transitions of the producer are appended to
+  `~/.glazyr/traces/glazyr-<pid>-<utc>.trace.jsonl`: JSON Lines, RFC 8785
+  (JCS) + SHA-256 hash chain from the genesis seed, one writer lock
+  shared by the tool path and the resident heartbeat. A restarted
+  bridge starts a new file and links back with `session_start.continues`.
+  Bridge-initiated browser relaunches are recorded as
+  `cause: bridge_recovery` actions.
+- New tool `glazyr_trace` (section 13): modes summary / tail / failures /
+  url / since / verify / note, `file=` to read a predecessor's trace,
+  a footer with the response's own token cost, the chain head hash and
+  chain status, and the section 13.4 cut order under budget.
+- `VERSION` constant in the bridge; the tokenizer branch taken at import
+  (`cl100k` or `chars/4`) is recorded and named on every token figure.
+- `_click_with_fallback` reports which method effected the click
+  (`mouse` / `dom_click` / `form_submit`).
+- Fix: on producer death the guard now clears the bridge overlay too
+  (0.3.3 kept it, so a dead browser's typed values / CHECKED marks
+  could be applied by DOM id to the fresh browser's page), bumps
+  `overlay_version`, and emits `invalidation{producer_dead}`.
+- Fix: values typed into password (credential) fields are never echoed:
+  not in the type ack, not in later peeks / finds (overlay and the
+  producer's own field value), not as a find match, not in the trace
+  (`value_redacted: true`), and credential-named query parameters of a
+  GET-submitted form show as `REDACTED` in URLs.
+- Launcher: adds `rfc8785` to the bridge venv (and to venvs created by
+  earlier versions). Without it the bridge runs with tracing off and
+  `glazyr_trace` says why. `GLAZYR_TRACE=off` disables tracing;
+  `GLAZYR_TRACE_DIR` moves it.
+
+Compatibility: all 0.3.3 tools and outputs unchanged apart from the two
+fixes; diagnostic suite 19/19 PASS (same as 0.3.3); Gauntlet smoke
+outputs byte-identical to the 0.3.3 post-publish smoke.
+
 ## 0.3.3 - 2026-11-24
 
 Resident-mode survival fixes, found by the v0.3.2 registry smoke

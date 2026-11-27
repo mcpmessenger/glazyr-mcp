@@ -46,7 +46,7 @@ const BRIDGE = path.join(__dirname, 'bridge', 'glazyr_mcp.py');
 const BUNDLE_VERSION = '0.3.0';
 const BUNDLE_URL = process.env.GLAZYR_BUNDLE_URL ||
   `https://github.com/mcpmessenger/glazyr-mcp/releases/download/v${BUNDLE_VERSION}/glazyr-browser-linux-x64.tar.xz`;
-const PIP_PACKAGES = ['mcp<2', 'protobuf', 'websocket-client', 'tiktoken'];
+const PIP_PACKAGES = ['mcp<2', 'protobuf', 'websocket-client', 'tiktoken', 'rfc8785'];
 
 // Resident bridge rendezvous (all under HOME).
 const RES_SOCK = path.join(HOME, 'resident.sock');
@@ -78,8 +78,20 @@ function checkPlatform() {
   }
 }
 
+// v0.3.4: Glazyr Trace canonicalizes with rfc8785 (RFC 8785 JCS). A
+// venv created by an earlier version lacks it: add it once. If that
+// fails the bridge still runs, with tracing off - glazyr_trace says so.
+function ensureTraceDep() {
+  const probe = spawnSync(VENV_PY, ['-c', 'import rfc8785'], { stdio: 'ignore' });
+  if (probe.status === 0) return;
+  log('adding rfc8785 (Glazyr Trace) to', VENV);
+  const r = spawnSync(VENV_PY, ['-m', 'pip', 'install', '--quiet', 'rfc8785'],
+    { stdio: ['ignore', 'ignore', 'inherit'] });
+  if (r.status !== 0) log('warning: rfc8785 install failed; tracing will be off.');
+}
+
 function ensureVenv() {
-  if (fs.existsSync(VENV_PY)) return;
+  if (fs.existsSync(VENV_PY)) { ensureTraceDep(); return; }
   log('first run: creating Python environment in', VENV);
   const probe = run('python3', ['--version']);
   if (probe.status !== 0) die('python3 not found — install Python 3.10+ and retry.');

@@ -24,6 +24,39 @@ COLLAPSE_TYPES = {'LIST_ITEM', 'TABLE_ROW', 'TABLE_CELL'}
 COLLAPSE_MIN_RUN = 12   # runs longer than this collapse
 COLLAPSE_KEEP = 8       # leading siblings rendered before the fold
 
+# v0.3.4: credential-bearing form controls (password inputs and their
+# kin by field name). Their values are never echoed - not the bridge's
+# typed-value overlay, not the producer's own field_value, not as a
+# find match (a substring oracle is an echo too).
+import re as _re
+_CRED_NAME = _re.compile(
+    r'passw|passwd|passcode|passphrase|pwd|secret|otp|one.?time|totp|'
+    r'cvv|cvc|csc|security.?code|card.?num|cc.?num', _re.I)
+
+def is_credential_control(fc):
+    """fc: a FormControlData message."""
+    if 'PASSWORD' in cq.FormControlType.Name(fc.form_control_type):
+        return True
+    return bool(_CRED_NAME.search(fc.field_name or ''))
+
+def redact_url(url):
+    """A GET-submitted credential lands in the URL (?password=...):
+    credential-named query parameters keep their name, lose their value."""
+    if not url or '?' not in url:
+        return url
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, quote
+    try:
+        p = urlsplit(url)
+        pairs = parse_qsl(p.query, keep_blank_values=True)
+    except Exception:
+        return url
+    if not any(_CRED_NAME.search(k) for k, _ in pairs):
+        return url
+    q = '&'.join(f'{quote(k, safe="")}=' + ('REDACTED' if _CRED_NAME.search(k)
+                                            else quote(v, safe=''))
+                 for k, v in pairs)
+    return urlunsplit((p.scheme, p.netloc, p.path, q, p.fragment))
+
 def node_text(node):
     a = node.content_attributes
     if a.WhichOneof('content_data') == 'text_data':
@@ -241,7 +274,10 @@ class Filter:
             fct = cq.FormControlType.Name(fc.form_control_type).replace('FORM_CONTROL_TYPE_', '')
             extra = f' name={fc.field_name!r}'
             if fc.field_value:
-                extra += f' val={fc.field_value[:30]!r}'
+                if is_credential_control(fc):
+                    extra += ' val=<redacted>'
+                else:
+                    extra += f' val={fc.field_value[:30]!r}'
             if fc.select_options:
                 extra += f' options={len(fc.select_options)}'
                 # v0.2.3: name the options (first few) - a bare count
@@ -374,7 +410,8 @@ def find_nodes(apc, query, limit=20):
             parts.append(a.anchor_data.url)
         elif t == 'FORM_CONTROL':
             parts.append(a.form_control_data.field_name)
-            parts.append(a.form_control_data.field_value)
+            if not is_credential_control(a.form_control_data):
+                parts.append(a.form_control_data.field_value)
         # Merged-content nodes carry their text in children; so do
         # some heading-like wrappers the producer types otherwise
         # (example.com's H1 is not a HEADING node). Any text-less
