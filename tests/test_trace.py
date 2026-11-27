@@ -263,6 +263,7 @@ class BridgeFixes(unittest.TestCase):
         os.environ['GLAZYR_TRACE_DIR'] = cls.d
         import glazyr_mcp as gm
         cls.gm = gm
+        gm._tracer_box['w'] = None      # fresh writer in this class's dir
 
     @classmethod
     def tearDownClass(cls):
@@ -278,14 +279,15 @@ class BridgeFixes(unittest.TestCase):
         gm._overlay_set(7, 'value', "value='hello' (bridge-asserted)")
         gm._state['trace_action'] = None
         ver = gm._state['overlay_version']
-        orig = (gm.producer_health, gm._force_relaunch)
+        orig = (gm.producer_health, gm._force_relaunch, gm.find_sem)
         gm.producer_health = lambda force=False: {'status': 'dead', 'via': 'popen',
                                                   'detail': 'browser exited'}
         gm._force_relaunch = lambda: True
+        gm.find_sem = lambda: (None, None)   # never see machine processes
         try:
             err = gm._guard_state_fresh()
         finally:
-            gm.producer_health, gm._force_relaunch = orig
+            gm.producer_health, gm._force_relaunch, gm.find_sem = orig
         self.assertIn('GLAZYR_PRODUCER_DEAD', err)
         self.assertEqual(gm._state['overlay'], {})
         self.assertEqual(gm._state['overlay_version'], ver + 1)

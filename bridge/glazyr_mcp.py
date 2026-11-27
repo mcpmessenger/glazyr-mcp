@@ -130,6 +130,7 @@ _state = {
     'assertions': {},     # (doc_key, dom_id, kind) -> {'n', 'desc'}: overlay entries by asserting action
     'trace_action': None, # n of the action event currently executing
     'nav_evidence': None, # how the last _navigate_attempt confirmed its landing
+    'death_unreported': None,  # producer death found outside the guard; the next guarded call reports it
 }
 _last_payload_pid = [None]   # producer pid behind the last read_payload()
 
@@ -222,6 +223,12 @@ def refresh_apc():
     seq, payload = read_payload()
     if payload is None:
         return False
+    # v0.3.4: a payload from a different producer than the state in
+    # hand means that state's browser is dead - drop it (and say so on
+    # the next guarded call) even when the newcomer's seq is equal.
+    swap = _swap_detail(_last_payload_pid[0])
+    if swap:
+        _state['death_unreported'] = _drop_dead_state(swap, 'epoch') + _ALREADY_FRESH
     if seq != _state['seq'] or _state['apc'] is None:
         apc = cq.AnnotatedPageContent()
         apc.ParseFromString(payload)
@@ -377,25 +384,18 @@ def _producer_health_uncached(now):
                               f'{int(seq_age)}s)'}
     return {'status': 'live', 'via': 'pid', 'detail': f'producer pid {sem_pid}'}
 
-def _guard_state_fresh():
-    """Read-path guard (v0.3.2): never serve a dead producer's state
-    as live. Returns None when the state in hand may be served, or an
-    explicit error string to return to the caller instead. On death:
-    record it, drop the corpse's cached state, attempt ONE respawn -
-    the caller still gets the error for this read, and the next read
-    sees the fresh browser's real (empty) state. Failing loudly is
-    the feature."""
-    if _state['apc'] is None and _state['seq'] == 0:
-        return None
-    health = producer_health()
-    if health['status'] != 'dead':
-        return None
+def _drop_dead_state(detail, via):
+    """The state in hand belongs to a dead producer: record the death,
+    drop the corpse's cached state - overlay included (v0.3.4 fix:
+    0.3.3 kept it, so a dead browser's typed values / CHECKED marks were
+    applied by DOM id to whatever page the fresh browser loaded) - and
+    trace freshness dead + invalidation{producer_dead}. Returns the
+    explicit error for the caller. Never relaunches by itself."""
     died_url, died_seq = _state['page_url'], _state['seq']
-    detail = health['detail']
     _state['producer_died'] = {'url': died_url, 'seq': died_seq,
-                               'detail': detail, 'via': health.get('via')}
+                               'detail': detail, 'via': via}
     _state['last_error'] = f'GLAZYR_PRODUCER_DEAD: {detail}'
-    # Drop the corpse's state so nothing downstream can serve it.
+    _trace_health({'status': 'dead', 'via': via, 'detail': detail})
     _state['apc'] = None
     _state['nodes'] = {}
     _state['sigs'] = {}
@@ -406,12 +406,56 @@ def _guard_state_fresh():
     _state['last_served'] = None
     _state['probe_cache'] = (0.0, None)
     _state['epoch'] = None
-    # v0.3.4 fix: the overlay is the corpse's state too. 0.3.3 kept it,
-    # so the dead browser's typed values / CHECKED marks were applied
-    # by DOM id to whatever unrelated page the fresh browser loaded.
     _state['overlay'] = {}
     _state['overlay_version'] += 1
     _trace_drop_all('producer_dead', detail=detail, always=True)
+    return (f'Glazyr error GLAZYR_PRODUCER_DEAD: the browser died '
+            f'({detail}). Its last state (url: {died_url or "(none)"}, '
+            f'seq {died_seq}) was NOT served - it is gone, not stale '
+            f'content presented as live.')
+
+def _swap_detail(new_pid):
+    """v0.3.4: producer identity is part of state identity. If the state
+    in hand was written by a producer other than the one writing now,
+    its browser is dead - whatever replaced it (ensure_browser's silent
+    relaunch of a dead CDP endpoint, an external restart) and whatever
+    seq the newcomer is at. Returns the death detail, or None."""
+    if _state['apc'] is None or not _state['epoch'] or not new_pid:
+        return None
+    new_epoch = _epoch_of(new_pid)
+    if new_epoch is None or new_epoch == _state['epoch']:
+        return None
+    return (f'the producer that wrote this state (epoch {_state["epoch"]}) '
+            f'is gone; a different browser process (epoch {new_epoch}) is '
+            f'now writing state')
+
+_ALREADY_FRESH = ' A fresh browser is already running; call glazyr_navigate to continue.'
+
+def _guard_state_fresh():
+    """Read-path guard (v0.3.2): never serve a dead producer's state
+    as live. Returns None when the state in hand may be served, or an
+    explicit error string to return to the caller instead. On death:
+    record it, drop the corpse's cached state, attempt ONE respawn -
+    the caller still gets the error for this read, and the next read
+    sees the fresh browser's real (empty) state. Failing loudly is
+    the feature.
+
+    v0.3.4: also catches the death 0.3.3 could not see - a browser
+    already replaced before the guard ran (ensure_browser relaunches a
+    dead CDP endpoint first, so producer_health saw the newcomer alive,
+    and an equal seq let refresh_apc keep serving the corpse)."""
+    pending = _state.pop('death_unreported', None)
+    if pending:
+        return pending
+    if _state['apc'] is None and _state['seq'] == 0:
+        return None
+    swap = _swap_detail(find_sem()[1])
+    if swap:
+        return _drop_dead_state(swap, 'epoch') + _ALREADY_FRESH
+    health = producer_health()
+    if health['status'] != 'dead':
+        return None
+    msg = _drop_dead_state(health['detail'], health.get('via'))
     rn = _trace_action('relaunch_browser', cause='bridge_recovery')
     try:
         _force_relaunch()
@@ -420,11 +464,7 @@ def _guard_state_fresh():
         _state['last_error'] += f'; respawn failed: {e}'
         _trace_outcome(rn, 'asserted', status='error',
                        error=f'respawn failed: {e}')
-    return (f'Glazyr error GLAZYR_PRODUCER_DEAD: the browser died '
-            f'({detail}). Its last state (url: {died_url or "(none)"}, '
-            f'seq {died_seq}) was NOT served - it is gone, not stale '
-            f'content presented as live. A fresh browser has been '
-            f'launched; call glazyr_navigate to continue.')
+    return msg + ' A fresh browser has been launched; call glazyr_navigate to continue.'
 
 # ---------- Glazyr Trace (v0.3.4) ----------
 # Session identity: one id per client attach (TRACE_FORMAT 5.1). The
@@ -873,8 +913,15 @@ def ensure_browser():
     # dead session, port held by a zombie) gets replaced with a fresh one.
     if _cdp_targets():
         return True
+    # v0.3.4: with state in hand this is a recovery from a dead browser
+    # - a real action (TRACE_FORMAT 8), recorded as such.
+    rn = None
+    if _state['apc'] is not None or _state['seq'] > 0:
+        rn = _trace_action('relaunch_browser', cause='bridge_recovery')
     _kill_shells()
-    return _start_browser()
+    ok = _start_browser()
+    _trace_outcome(rn, 'asserted', status='ok')
+    return ok
 
 def _force_relaunch():
     """v0.2.3 recovery: the browser answers CDP but its page never
@@ -1595,10 +1642,17 @@ def glazyr_navigate(url: str, level: str = 'standard', full: bool = False) -> st
                            status='error', error=exc or msg)
             return msg
     _nav_outcome(ref, (_state['nav_evidence'] or {}).get('old_doc'))
+    died = _state.pop('death_unreported', None)
     if full:
         out = do_peek(level, force=True)
     else:
         out = page_summary()
+    if died:
+        # The agent asked to go somewhere new: the navigation stands, on
+        # the fresh browser, but the death is not hidden.
+        out = ('# note: ' + died.replace(_ALREADY_FRESH, '') +
+               ' This navigation ran on a fresh browser; anything typed or '
+               'checked before is gone.\n' + out)
     if recovered:
         out = ('# note: the first navigation attempt did not land '
                '(browser wedged); the browser was relaunched and the '

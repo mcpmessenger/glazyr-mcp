@@ -29,6 +29,18 @@ bundle (0.3.0) is unchanged and no producer changes were made.
   (0.3.3 kept it, so a dead browser's typed values / CHECKED marks
   could be applied by DOM id to the fresh browser's page), bumps
   `overlay_version`, and emits `invalidation{producer_dead}`.
+- Fix: a dead browser is no longer served as live. Every read called
+  `ensure_browser()` before the guard; it silently replaced a dead
+  browser, so the guard saw the newcomer alive, and when the new
+  producer's seq equalled the old one `refresh_apc` (keyed on seq only)
+  kept serving the dead page and its overlay - and actions resolved
+  stale node ids against it. Producer identity (pid + start time) is now
+  part of state identity: a state written by a producer other than the
+  one writing now is dropped as `producer_dead` (overlay cleared,
+  invalidation emitted) and the next call answers GLAZYR_PRODUCER_DEAD,
+  without a second relaunch; a navigate that discovers it says so.
+  `ensure_browser`'s relaunch is traced as a `bridge_recovery` action.
+  Drill: `tests/test_dead_browser.py`, `tests/acceptance/drill_dead_browser.py`.
 - Fix: values typed into password (credential) fields are never echoed:
   not in the type ack, not in later peeks / finds (overlay and the
   producer's own field value), not as a find match, not in the trace
