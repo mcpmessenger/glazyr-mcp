@@ -191,42 +191,126 @@ function heartbeatFresh() {
   }
 }
 
-function probeSocket(timeoutMs = 1500) {
+// v0.3.4 version handshake. The resident answers `glazyr/handshake`
+// in its protocol shield (before the MCP SDK sees the line) with its
+// version and pid. A pre-0.3.4 resident answers -32601: no handshake,
+// which counts as a different version. Resolves {version, pid},
+// {legacy: true}, or null (unreachable).
+function handshake(timeoutMs = 2000) {
   return new Promise((resolve) => {
     const s = net.connect(RES_SOCK);
-    const done = (ok) => { try { s.destroy(); } catch {} resolve(ok); };
+    let buf = '';
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      try { s.destroy(); } catch {}
+      resolve(v);
+    };
     s.setTimeout(timeoutMs);
-    s.once('connect', () => done(true));
-    s.once('timeout', () => done(false));
-    s.once('error', () => done(false));
+    s.once('connect', () => {
+      s.write(JSON.stringify({ jsonrpc: '2.0', id: 'glazyr-handshake',
+                               method: 'glazyr/handshake' }) + '\n');
+    });
+    s.on('data', (d) => {
+      buf += d.toString();
+      const i = buf.indexOf('\n');
+      if (i < 0) return;
+      try {
+        const m = JSON.parse(buf.slice(0, i));
+        if (m.result && m.result.version) {
+          done({ version: String(m.result.version), pid: m.result.pid });
+        } else {
+          done({ legacy: true });
+        }
+      } catch {
+        done(null);
+      }
+    });
+    s.once('timeout', () => done(null));
+    s.once('error', () => done(null));
+    s.once('close', () => done(null));
   });
 }
 
-// Healthy = identifiable bridge process, alive, heartbeating, and its
-// socket accepts a connection. Anything else is reclaimed, never
-// attached to.
-async function residentHealthy() {
+// Resident state: 'healthy' (same version, attachable), 'mismatch'
+// (a resident of another version - never attached to), or 'down'.
+// Healthy also requires an identifiable bridge process, alive and
+// heartbeating; the handshake, not resident.json, is the authority on
+// version (the json can be stale or missing).
+async function residentStatus() {
   const info = readResident();
-  if (!info || !info.pid) return false;
-  if (!pidAlive(info.pid) || !pidIsBridge(info.pid)) return false;
-  if (!heartbeatFresh()) return false;
-  if (info.sock && info.sock !== RES_SOCK) return false;
-  return probeSocket();
+  const basic = info && info.pid && pidAlive(info.pid) && pidIsBridge(info.pid) &&
+    heartbeatFresh() && (!info.sock || info.sock === RES_SOCK);
+  const hs = await handshake();
+  if (!hs) return { state: 'down', pid: info && info.pid };
+  if (hs.legacy) {
+    return { state: 'mismatch', pid: info && info.pid,
+             version: `${(info && info.version) || 'unknown'} (pre-0.3.4, no handshake)` };
+  }
+  if (hs.version !== VERSION) return { state: 'mismatch', pid: hs.pid, version: hs.version };
+  if (!basic) return { state: 'down', pid: hs.pid };
+  return { state: 'healthy', pid: hs.pid, version: hs.version };
 }
 
-async function reclaimResident() {
-  const info = readResident();
-  if (info && info.pid && pidAlive(info.pid) && pidIsBridge(info.pid)) {
-    log(`reclaiming stale resident bridge (pid ${info.pid})`);
-    try { process.kill(info.pid, 'SIGTERM'); } catch {}
-    const t0 = Date.now();
-    while (pidAlive(info.pid) && Date.now() - t0 < 3000) {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    if (pidAlive(info.pid)) {
-      try { process.kill(info.pid, 'SIGKILL'); } catch {}
-    }
+// Back-compat name: healthy = attachable by THIS launcher.
+async function residentHealthy() {
+  return (await residentStatus()).state === 'healthy';
+}
+
+// Residents serving this HOME, found by /proc scan - including one
+// whose resident.json / socket were deleted while it kept the instance
+// lock (it is then unreachable, and every new resident exits on the
+// lock). Only processes older than the start window are returned, so a
+// resident another launcher is still starting is never touched.
+function residentsForHome() {
+  const out = [];
+  let pids = [];
+  try { pids = fs.readdirSync('/proc').filter((p) => /^\d+$/.test(p)); } catch { return out; }
+  let clkTck = 100;
+  let boot = 0;
+  try {
+    const up = parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]);
+    boot = Date.now() / 1000 - up;
+  } catch {}
+  for (const p of pids) {
+    const pid = parseInt(p, 10);
+    if (pid === process.pid) continue;
+    try {
+      const cmd = fs.readFileSync(`/proc/${p}/cmdline`, 'utf8');
+      if (!cmd.includes('glazyr_mcp') || !cmd.includes('--resident')) continue;
+      const env = fs.readFileSync(`/proc/${p}/environ`, 'utf8').split('\0');
+      const get = (k) => { const e = env.find((x) => x.startsWith(k + '=')); return e ? e.slice(k.length + 1) : null; };
+      const home = get('GLAZYR_HOME') || path.join(get('HOME') || os.homedir(), '.glazyr');
+      if (path.resolve(home) !== path.resolve(HOME)) continue;
+      const stat = fs.readFileSync(`/proc/${p}/stat`, 'utf8');
+      const start = parseInt(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19], 10) / clkTck;
+      const ageMs = boot ? (Date.now() / 1000 - (boot + start)) * 1000 : Infinity;
+      if (ageMs > RES_START_TIMEOUT_MS) out.push(pid);
+    } catch {}
   }
+  return out;
+}
+
+async function stopPid(pid, why) {
+  if (!pid || !pidAlive(pid) || !pidIsBridge(pid)) return;
+  log(`stopping resident bridge pid ${pid} (${why})`);
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+  const t0 = Date.now();
+  while (pidAlive(pid) && Date.now() - t0 < 3000) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (pidAlive(pid)) {
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+}
+
+async function reclaimResident(status) {
+  const info = readResident();
+  const why = status && status.state === 'mismatch'
+    ? `version ${status.version}, launcher is ${VERSION}` : 'stale or unreachable';
+  const pids = new Set([info && info.pid, status && status.pid, ...residentsForHome()]);
+  for (const pid of pids) await stopPid(pid, why);
   for (const f of [RES_SOCK, RES_JSON, RES_HB]) {
     try { fs.unlinkSync(f); } catch {}
   }
@@ -282,14 +366,22 @@ function attachRelay() {
 }
 
 async function runResident() {
-  if (await residentHealthy()) {
+  let status = await residentStatus();
+  if (status.state === 'healthy') {
     const code = await attachRelay();
     if (code === 0) return true;
     // Resident died or refused mid-attach: fall through and restart
     // it once rather than failing the client outright.
     log('resident attach failed; restarting resident');
+    status = { state: 'down', pid: status.pid };
+  } else if (status.state === 'mismatch') {
+    // Never attach across versions. One resident owns the browser per
+    // machine (fixed CDP port, shell kill by scan), so a private bridge
+    // beside it would fight over the browser: replace it instead.
+    log(`resident bridge is version ${status.version} (pid ${status.pid}); ` +
+        `this launcher is ${VERSION} - not attaching across versions, replacing it`);
   }
-  await reclaimResident();
+  await reclaimResident(status);
   if (!(await startResident())) return false;
   const code = await attachRelay();
   return code === 0;

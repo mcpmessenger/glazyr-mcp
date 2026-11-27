@@ -2107,6 +2107,18 @@ def _run_resident():
                         await writer.drain()
                         continue
                     method = obj.get('method')
+                    # v0.3.4 version handshake: the launcher attaches
+                    # only to a resident of its own version.
+                    if method == 'glazyr/handshake' and 'id' in obj:
+                        writer.write((json.dumps({
+                            'jsonrpc': '2.0', 'id': obj.get('id'),
+                            'result': {'name': 'glazyr-bridge',
+                                       'version': _package_version(),
+                                       'bridge_version': VERSION,
+                                       'pid': os.getpid(),
+                                       'home': home}}) + '\n').encode())
+                        await writer.drain()
+                        continue
                     if method is not None and \
                             method not in _KNOWN_METHODS:
                         if 'id' in obj:

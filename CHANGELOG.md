@@ -46,6 +46,18 @@ bundle (0.3.0) is unchanged and no producer changes were made.
   producer's own field value), not as a find match, not in the trace
   (`value_redacted: true`), and credential-named query parameters of a
   GET-submitted form show as `REDACTED` in URLs.
+- Resident version handshake: the launcher attaches only to a resident
+  of its own version. The resident answers `glazyr/handshake` in its
+  protocol shield ({version, bridge_version, pid, home}); a resident
+  of another version - or a pre-0.3.4 one, which has no handshake - is
+  stopped and replaced, never attached to (one resident owns the
+  browser per machine, so a private bridge beside it is not an option).
+  Residents for this home are also found by /proc scan, so one whose
+  resident.json / socket were deleted while it kept the instance lock is
+  reclaimed instead of forcing a 30 s wait and a private-bridge fallback
+  on every call. Limitation: launchers older than 0.3.4 have no
+  handshake and still attach to whatever resident answers.
+  Drill: `tests/acceptance/drill_version_handshake.py`.
 - Launcher: adds `rfc8785` to the bridge venv (and to venvs created by
   earlier versions). Without it the bridge runs with tracing off and
   `glazyr_trace` says why. `GLAZYR_TRACE=off` disables tracing;

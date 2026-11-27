@@ -13,6 +13,8 @@ copied, never modified).
     RUN=c1 tests/acceptance/ns.sh /root/.glazyr/venv/bin/python tests/acceptance/live_c.py 1
     RUN=c2 tests/acceptance/ns.sh /root/.glazyr/venv/bin/python tests/acceptance/live_c.py 2
     RUN=d  tests/acceptance/ns.sh tests/acceptance/gauntlet_smoke.sh
+    RUN=drill-dead    tests/acceptance/ns.sh /root/.glazyr/venv/bin/python tests/acceptance/drill_dead_browser.py 4
+    RUN=drill-version tests/acceptance/ns.sh /root/.glazyr/venv/bin/python tests/acceptance/drill_version_handshake.py
 
 | File | Role |
 |---|---|
@@ -21,6 +23,8 @@ copied, never modified).
 | `live_session.py` | (b) navigate / type / password / checkbox / submit; secret-leak and chain checks |
 | `live_c.py`, `worker.py` | (c) producer kill / renderer wedge, client kill mid-click (resident and private tree kill), resume from a dead file |
 | `gauntlet_smoke.sh` | (d) three separate mcporter 0.17.1 processes against the Gauntlet fixture (needs Node >= 20 at `/opt/node22`) |
+| `drill_dead_browser.py` | whole-browser kills; first call after each death must be GLAZYR_PRODUCER_DEAD, no stale page/overlay |
+| `drill_version_handshake.py` | 0.3.3 / 0.3.4 / 0.3.5 residents: attach only same-version, reclaim an unreachable lock holder |
 | `refcheck.py`, `dump_trace.py` | reference-checker verdicts; one-line-per-event dump |
 | `fixtures/` | login / done pages (`/slow` is served by `live_c.py` with a 25 s delay) |
 
