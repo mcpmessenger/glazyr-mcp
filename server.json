@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mcpmessenger/glazyr",
   "title": "Glazyr",
-  "description": "Zero-copy browser perception for AI agents over MCP. ~13x fewer tokens than CDP or Playwright.",
+  "description": "Zero-copy browser perception for AI agents. 5.9x fewer tokens than Playwright MCP, 74x vs CDP.",
   "repository": {
     "url": "https://github.com/mcpmessenger/glazyr-mcp",
     "source": "github"
